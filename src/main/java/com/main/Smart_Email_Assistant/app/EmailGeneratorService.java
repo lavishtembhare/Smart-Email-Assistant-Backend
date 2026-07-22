@@ -62,6 +62,7 @@ public class EmailGeneratorService {
                         .onRetryExhaustedThrow((spec, signal) -> signal.failure()))
                 .onErrorResume(WebClientResponseException.class, ex -> {
                     int code = ex.getStatusCode().value();
+                    System.err.println("Gemini raw error body: " + ex.getResponseBodyAsString()); // TEMP — remove after debugging
                     String message = switch (code) {
                         case 503 -> "Gemini is temporarily overloaded — please try again in a moment.";
                         case 429 -> "Gemini rate limit reached — please try again shortly.";
