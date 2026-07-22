@@ -18,6 +18,12 @@ public class SmartEmailAssistantController {
         return ResponseEntity.ok(response);
     }
 
+    @PostMapping("/compose")
+    public ResponseEntity<String> composeEmail(@RequestBody EmailComposeRequest composeRequest){
+        String response = emailGeneratorService.generateNewEmail(composeRequest);
+        return ResponseEntity.ok(response);
+    }
+
     @ExceptionHandler(ResponseStatusException.class)
     public ResponseEntity<String> handleServiceUnavailable(ResponseStatusException ex) {
         return ResponseEntity.status(ex.getStatusCode()).body(ex.getReason());
