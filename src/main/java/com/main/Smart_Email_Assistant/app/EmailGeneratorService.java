@@ -50,19 +50,26 @@ public class EmailGeneratorService {
         );
 
         String response = webClient.post()
-                .uri(geminiApiUrl + "?key=" + geminiApiKey)
+                .uri(geminiApiUrl)
                 .header("Content-Type", "application/json")
+                .header("x-goog-api-key", geminiApiKey) // key stays out of URL/query logs
                 .bodyValue(requestBody)
                 .retrieve()
                 .bodyToMono(String.class)
                 .retryWhen(Retry.backoff(3, Duration.ofSeconds(2))
-                        .filter(ex -> ex instanceof WebClientResponseException.ServiceUnavailable)
+                        .filter(ex -> ex instanceof WebClientResponseException wcre
+                                && (wcre.getStatusCode().value() == 503 || wcre.getStatusCode().value() == 429))
                         .onRetryExhaustedThrow((spec, signal) -> signal.failure()))
-                .onErrorResume(WebClientResponseException.ServiceUnavailable.class, ex ->
-                        Mono.error(new ResponseStatusException(
-                                HttpStatus.SERVICE_UNAVAILABLE,
-                                "Gemini is temporarily overloaded — please try again in a moment."))
-                )
+                .onErrorResume(WebClientResponseException.class, ex -> {
+                    int code = ex.getStatusCode().value();
+                    String message = switch (code) {
+                        case 503 -> "Gemini is temporarily overloaded — please try again in a moment.";
+                        case 429 -> "Gemini rate limit reached — please try again shortly.";
+                        case 401, 403 -> "Gemini API key was rejected — check GEMINI_KEY.";
+                        default -> "Gemini request failed with status " + code;
+                    };
+                    return Mono.error(new ResponseStatusException(ex.getStatusCode(), message));
+                })
                 .block();
 
         return extractResponseContent(response);
@@ -72,9 +79,24 @@ public class EmailGeneratorService {
         try {
             ObjectMapper mapper = new ObjectMapper();
             JsonNode rootNode = mapper.readTree(response);
-            return rootNode.path("candidates").get(0).path("content").path("parts").get(0).path("text").asString();
+            JsonNode candidates = rootNode.path("candidates");
+
+            if (candidates.isEmpty()) {
+                // Empty candidates usually means the prompt was blocked by safety filters
+                // rather than a real server/parse error, so surface that distinctly.
+                String blockReason = rootNode.path("promptFeedback").path("blockReason").asString(null);
+                throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
+                        blockReason != null
+                                ? "Gemini blocked this content: " + blockReason
+                                : "Gemini returned no candidates for this request.");
+            }
+
+            return candidates.get(0).path("content").path("parts").get(0).path("text").asString();
+        } catch (ResponseStatusException e) {
+            throw e; // let the controller's existing handler format this one
         } catch (Exception e) {
-            return "Error processing request: " + e.getMessage();
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
+                    "Failed to parse Gemini response: " + e.getMessage());
         }
     }
 
