@@ -27,7 +27,6 @@ public class EmailGeneratorService {
     private static final Duration RETRY_BACKOFF = Duration.ofSeconds(2);
 
     private final WebClient webClient;
-    // Shared, thread-safe — building a new one per request is wasted work.
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${gemini.api.url}")
@@ -36,7 +35,6 @@ public class EmailGeneratorService {
     @Value("${gemini.api.key}")
     private String geminiApiKey;
 
-    // Defaulted so no application.properties change is required to pick this up.
     @Value("${gemini.api.timeout-seconds:20}")
     private int timeoutSeconds;
 
@@ -55,9 +53,6 @@ public class EmailGeneratorService {
         String prompt = buildComposePrompt(composeRequest);
         return callGemini(prompt);
     }
-
-    // Shared Gemini call: request body, timeout, retry/backoff, and error handling
-    // used by both reply generation and new-email composition.
     private String callGemini(String prompt) {
         Map<String, Object> requestBody = Map.of(
                 "contents", new Object[]{
@@ -91,8 +86,6 @@ public class EmailGeneratorService {
                     return Mono.error(new ResponseStatusException(ex.getStatusCode(), message));
                 })
                 .onErrorResume(WebClientRequestException.class, ex -> {
-                    // Thrown for DNS/connection/TLS failures — never a WebClientResponseException,
-                    // so it must be handled separately or it slips through unhandled.
                     log.error("Could not reach Gemini API at {}", geminiApiUrl, ex);
                     return Mono.error(new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
                             "Could not reach Gemini — check network connectivity and GEMINI_URL."));
@@ -103,7 +96,6 @@ public class EmailGeneratorService {
                             "Gemini did not respond in time — please try again."));
                 })
                 .onErrorResume(ex -> !(ex instanceof ResponseStatusException), ex -> {
-                    // Safety net so nothing unexpected leaks a raw stack trace to the client.
                     log.error("Unexpected error calling Gemini", ex);
                     return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
                             "Unexpected error while generating the email."));
@@ -118,7 +110,6 @@ public class EmailGeneratorService {
             int code = wcre.getStatusCode().value();
             return code == 503 || code == 429;
         }
-        // Transient connectivity blips are worth a retry too.
         return ex instanceof WebClientRequestException;
     }
 
@@ -128,8 +119,6 @@ public class EmailGeneratorService {
             JsonNode candidates = rootNode.path("candidates");
 
             if (candidates.isEmpty()) {
-                // Empty candidates usually means the prompt was blocked by safety filters
-                // rather than a real server/parse error, so surface that distinctly.
                 String blockReason = rootNode.path("promptFeedback").path("blockReason").asString(null);
                 throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
                         blockReason != null
@@ -141,8 +130,6 @@ public class EmailGeneratorService {
             JsonNode parts = candidate.path("content").path("parts");
 
             if (parts.isMissingNode() || parts.isEmpty()) {
-                // A finishReason like SAFETY/RECITATION/MAX_TOKENS can produce a candidate
-                // with no parts at all — indexing into it directly would NPE.
                 String finishReason = candidate.path("finishReason").asString("UNKNOWN");
                 String message = switch (finishReason) {
                     case "SAFETY" -> "Gemini blocked this content for safety reasons.";
@@ -160,9 +147,8 @@ public class EmailGeneratorService {
             return text;
 
         } catch (ResponseStatusException e) {
-            throw e; // let the controller's existing handler format this one
+            throw e;
         } catch (Exception e) {
-            // Don't leak internal exception details to the client — log them instead.
             log.error("Failed to parse Gemini response", e);
             throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "Failed to parse Gemini response.");
         }
@@ -175,9 +161,6 @@ public class EmailGeneratorService {
     }
 
     private void validate(EmailComposeRequest request) {
-        if (request.getRecipientEmail() == null || request.getRecipientEmail().isBlank()) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "recipientEmail is required.");
-        }
         if (request.getSubject() == null || request.getSubject().isBlank()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "subject is required.");
         }
@@ -203,7 +186,9 @@ public class EmailGeneratorService {
             prompt.append("Use a ").append(request.getTone()).append(" tone. ");
         }
 
-        prompt.append("\nRecipient: ").append(request.getRecipientEmail());
+        if (request.getRecipientEmail() != null && !request.getRecipientEmail().isBlank()) {
+            prompt.append("\nRecipient: ").append(request.getRecipientEmail());
+        }
         prompt.append("\nSubject: ").append(request.getSubject());
 
         if (request.getAdditionalContext() != null && !request.getAdditionalContext().isBlank()) {
