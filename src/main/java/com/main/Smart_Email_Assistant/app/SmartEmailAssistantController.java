@@ -17,7 +17,10 @@ public class SmartEmailAssistantController {
         String response = emailGeneratorService.generateEmailReply(emailRequest);
         return ResponseEntity.ok(response);
     }
-
+    @GetMapping("/health")
+    public String health() {
+        return "OK";
+    }
     @PostMapping("/compose")
     public ResponseEntity<String> composeEmail(@RequestBody EmailComposeRequest composeRequest){
         String response = emailGeneratorService.generateNewEmail(composeRequest);
