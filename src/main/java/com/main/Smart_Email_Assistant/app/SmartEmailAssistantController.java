@@ -19,7 +19,7 @@ public class SmartEmailAssistantController {
     }
     @GetMapping("/health")
     public String health() {
-        System.out.println("Ok");
+//        System.out.println("Ok");
         return "OK";
     }
     @PostMapping("/compose")
