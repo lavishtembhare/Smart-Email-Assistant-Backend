@@ -15,6 +15,7 @@ import reactor.util.retry.Retry;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeoutException;
 
@@ -29,13 +30,16 @@ public class EmailGeneratorService {
     private final WebClient webClient;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @Value("${gemini.api.url}")
-    private String geminiApiUrl;
+    @Value("${groq.api.url}")
+    private String groqApiUrl;
 
-    @Value("${gemini.api.key}")
-    private String geminiApiKey;
+    @Value("${groq.api.key}")
+    private String groqApiKey;
 
-    @Value("${gemini.api.timeout-seconds:20}")
+    @Value("${groq.model}")
+    private String groqModel;
+
+    @Value("${groq.api.timeout-seconds:20}")
     private int timeoutSeconds;
 
     public EmailGeneratorService(WebClient.Builder webClientBuilder) {
@@ -45,27 +49,27 @@ public class EmailGeneratorService {
     public String generateEmailReply(EmailRequest emailRequest) {
         validate(emailRequest);
         String prompt = buildReplyPrompt(emailRequest);
-        return callGemini(prompt);
+        return callGroq(prompt);
     }
 
     public String generateNewEmail(EmailComposeRequest composeRequest) {
         validate(composeRequest);
         String prompt = buildComposePrompt(composeRequest);
-        return callGemini(prompt);
+        return callGroq(prompt);
     }
-    private String callGemini(String prompt) {
+
+    private String callGroq(String prompt) {
         Map<String, Object> requestBody = Map.of(
-                "contents", new Object[]{
-                        Map.of("parts", new Object[]{
-                                Map.of("text", prompt)
-                        })
-                }
+                "model", groqModel,
+                "messages", List.of(
+                        Map.of("role", "user", "content", prompt)
+                )
         );
 
         String response = webClient.post()
-                .uri(geminiApiUrl)
+                .uri(groqApiUrl)
                 .header("Content-Type", "application/json")
-                .header("x-goog-api-key", geminiApiKey) // key stays out of URL/query logs
+                .header("Authorization", "Bearer " + groqApiKey)
                 .bodyValue(requestBody)
                 .retrieve()
                 .bodyToMono(String.class)
@@ -75,28 +79,28 @@ public class EmailGeneratorService {
                         .onRetryExhaustedThrow((spec, signal) -> signal.failure()))
                 .onErrorResume(WebClientResponseException.class, ex -> {
                     int code = ex.getStatusCode().value();
-                    log.warn("Gemini API returned status {} ({})", code, ex.getStatusText());
-                    log.debug("Gemini raw error body: {}", ex.getResponseBodyAsString());
+                    log.warn("Groq API returned status {} ({})", code, ex.getStatusText());
+                    log.debug("Groq raw error body: {}", ex.getResponseBodyAsString());
                     String message = switch (code) {
-                        case 503 -> "Gemini is temporarily overloaded — please try again in a moment.";
-                        case 429 -> "Gemini rate limit reached — please try again shortly.";
-                        case 401, 403 -> "Gemini API key was rejected — check GEMINI_KEY.";
-                        default -> "Gemini request failed with status " + code;
+                        case 503 -> "Groq is temporarily overloaded — please try again in a moment.";
+                        case 429 -> "Groq rate limit reached — please try again shortly.";
+                        case 401, 403 -> "Groq API key was rejected — check GROQ_API_KEY.";
+                        default -> "Groq request failed with status " + code;
                     };
                     return Mono.error(new ResponseStatusException(ex.getStatusCode(), message));
                 })
                 .onErrorResume(WebClientRequestException.class, ex -> {
-                    log.error("Could not reach Gemini API at {}", geminiApiUrl, ex);
+                    log.error("Could not reach Groq API at {}", groqApiUrl, ex);
                     return Mono.error(new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                            "Could not reach Gemini — check network connectivity and GEMINI_URL."));
+                            "Could not reach Groq — check network connectivity and groq.api.url."));
                 })
                 .onErrorResume(TimeoutException.class, ex -> {
-                    log.warn("Gemini request timed out after {}s", timeoutSeconds);
+                    log.warn("Groq request timed out after {}s", timeoutSeconds);
                     return Mono.error(new ResponseStatusException(HttpStatus.GATEWAY_TIMEOUT,
-                            "Gemini did not respond in time — please try again."));
+                            "Groq did not respond in time — please try again."));
                 })
                 .onErrorResume(ex -> !(ex instanceof ResponseStatusException), ex -> {
-                    log.error("Unexpected error calling Gemini", ex);
+                    log.error("Unexpected error calling Groq", ex);
                     return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
                             "Unexpected error while generating the email."));
                 })
@@ -116,41 +120,35 @@ public class EmailGeneratorService {
     private String extractResponseContent(String response) {
         try {
             JsonNode rootNode = objectMapper.readTree(response);
-            JsonNode candidates = rootNode.path("candidates");
+            JsonNode choices = rootNode.path("choices");
 
-            if (candidates.isEmpty()) {
-                String blockReason = rootNode.path("promptFeedback").path("blockReason").asString(null);
+            if (choices.isEmpty()) {
+                String errorMessage = rootNode.path("error").path("message").asString(null);
                 throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
-                        blockReason != null
-                                ? "Gemini blocked this content: " + blockReason
-                                : "Gemini returned no candidates for this request.");
+                        errorMessage != null
+                                ? "Groq returned an error: " + errorMessage
+                                : "Groq returned no choices for this request.");
             }
 
-            JsonNode candidate = candidates.get(0);
-            JsonNode parts = candidate.path("content").path("parts");
+            JsonNode choice = choices.get(0);
+            String finishReason = choice.path("finish_reason").asString("unknown");
+            String text = choice.path("message").path("content").asString(null);
 
-            if (parts.isMissingNode() || parts.isEmpty()) {
-                String finishReason = candidate.path("finishReason").asString("UNKNOWN");
+            if (text == null || text.isBlank()) {
                 String message = switch (finishReason) {
-                    case "SAFETY" -> "Gemini blocked this content for safety reasons.";
-                    case "RECITATION" -> "Gemini blocked this content due to potential copyright recitation.";
-                    case "MAX_TOKENS" -> "Gemini's response was cut off before returning any content — try a shorter input.";
-                    default -> "Gemini returned an empty response (finishReason: " + finishReason + ").";
+                    case "content_filter" -> "Groq blocked this content for safety reasons.";
+                    case "length" -> "Groq's response was cut off before returning any content — try a shorter input.";
+                    default -> "Groq returned an empty response (finishReason: " + finishReason + ").";
                 };
                 throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY, message);
-            }
-
-            String text = parts.get(0).path("text").asString(null);
-            if (text == null || text.isBlank()) {
-                throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "Gemini returned an empty reply.");
             }
             return text;
 
         } catch (ResponseStatusException e) {
             throw e;
         } catch (Exception e) {
-            log.error("Failed to parse Gemini response", e);
-            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "Failed to parse Gemini response.");
+            log.error("Failed to parse Groq response", e);
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "Failed to parse Groq response.");
         }
     }
 
