@@ -25,7 +25,6 @@ public class EmailGeneratorService {
     private static final Logger log = LoggerFactory.getLogger(EmailGeneratorService.class);
 
     private static final int MAX_RETRIES = 3;
-    private static final Duration RETRY_BACKOFF = Duration.ofSeconds(2);
 
     private final WebClient webClient;
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -41,6 +40,10 @@ public class EmailGeneratorService {
 
     @Value("${groq.api.timeout-seconds:20}")
     private int timeoutSeconds;
+
+    // Was a hard-coded 2s constant; now configurable so tests don't have to wait ~14s per retry scenario.
+    @Value("${groq.api.retry-backoff-ms:2000}")
+    private long retryBackoffMs;
 
     public EmailGeneratorService(WebClient.Builder webClientBuilder) {
         this.webClient = webClientBuilder.build();
@@ -74,7 +77,7 @@ public class EmailGeneratorService {
                 .retrieve()
                 .bodyToMono(String.class)
                 .timeout(Duration.ofSeconds(timeoutSeconds))
-                .retryWhen(Retry.backoff(MAX_RETRIES, RETRY_BACKOFF)
+                .retryWhen(Retry.backoff(MAX_RETRIES, Duration.ofMillis(retryBackoffMs))
                         .filter(EmailGeneratorService::isRetryable)
                         .onRetryExhaustedThrow((spec, signal) -> signal.failure()))
                 .onErrorResume(WebClientResponseException.class, ex -> {
